@@ -1,3 +1,10 @@
+# для ИИ-агента
+pydantic
+langchain_openai
+langchain
+langgraph
+
+# для RAG-системы
 pandas
 tantivy
 kuzu
