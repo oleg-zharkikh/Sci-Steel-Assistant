@@ -1,3 +1,5 @@
+dotenv
+
 # для ИИ-агента
 pydantic
 langchain_openai

@@ -5,6 +5,7 @@ import secrets
 import string
 import requests
 import re
+import os
 from typing import Any, Dict, List, Optional, Tuple, TypedDict, Annotated
 from operator import add
 
@@ -16,16 +17,56 @@ from langgraph.graph import StateGraph, END, START, MessagesState
 from langgraph.graph.state import CompiledStateGraph
 import time
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Конфигурация ─────────────────────────────────────────────────────────────
-MODEL = 'qwen/qwen3.5-9b'
-LLM_URL = 'http://127.0.0.1:1234/v1'
-API_BASE_URL = 'http://127.0.0.1:8000'
+LOCAL_MODEL = 'qwen/qwen3.5-9b'
+LOCAL_LLM_URL = 'http://127.0.0.1:1234/v1'
+LOCAL_API_KEY = "lm-studio"
 
-# Лимит итераций поиска для защиты от бесконечного зацикливания
+# Общие параметры
 MAX_SEARCH_ITER = 5
+"""Лимит итераций поиска для защиты от бесконечного зацикливания"""
+
+USE_LOCAL_LLM = False
+"""True = LM Studio (локально), False = Yandex AI Studio."""
+
+# Локальная LLM (LM Studio)
+
+# Облачная LLM (Yandex AI Studio)
+YANDEX_CLOUD_FOLDER = "b1g4l2qvbrkalmtemb56"
+"""folder ID."""
+
+YANDEX_CLOUD_API_KEY = os.getenv('YANDEX_CLOUD_API_KEY', '')
+"""API ключ"""
+
+YANDEX_CLOUD_MODEL = "qwen3.6-35b-a3b/latest"
+
+# ── Инициализация LLM ────────────────────────────────────────────────────────
+if USE_LOCAL_LLM:
+    print(f"[INFO] Используем локальную LLM: {LOCAL_MODEL}")
+    llm = ChatOpenAI(
+        base_url=LOCAL_LLM_URL,
+        api_key=LOCAL_API_KEY,
+        model=LOCAL_MODEL,
+        temperature=0.1,
+        max_tokens=10000
+    )
+else:
+    print(f"[INFO] Используем Yandex AI Studio: {YANDEX_CLOUD_MODEL}")
+    llm = ChatOpenAI(
+        base_url="https://ai.api.cloud.yandex.net/v1",
+        api_key=YANDEX_CLOUD_API_KEY,
+        model=f"gpt://{YANDEX_CLOUD_FOLDER}/{YANDEX_CLOUD_MODEL}",
+        temperature=0.1,
+        max_tokens=10000,
+        reasoning_effort=None,
+    )
 
 
 # ── Состояние агента ─────────────────────────────────────────────────────────
@@ -88,6 +129,7 @@ def _make_api_request(
 
 
 # ── Инструменты ──────────────────────────────────────────────────────────────
+# ЗАГЛУШКА:
 stub_data = """Мы успешно получили тонкие пленки BiFe(1-x)PdxO3 (BFPxO) (т.е. сегнетоэлектрический феррит висмута с частичным замещением ионов палладия в позиции Fe), а также гетероструктуру BFPxO/NiO методом золь-гель. В данной работе мы пытаемся разобраться в двух аспектах проблемы. С одной стороны, мы выясняем важную роль легирования палладием в оптоэлектронных характеристиках BFPxO. Мы устанавливаем взаимосвязи между валентностью палладия, искажением решетки и оптоэлектронными характеристиками BFPxO. Мы подтверждаем, что легирование палладием может минимизировать постоянную времени отклика BiFe(1-x)PdxO3 ниже 10 мс; при этом обнаружительная способность гетероструктуры BFPO/NiO может достигать примерно 109 Джонс. С другой стороны, для получения представления о различных стадиях затухания, существующих в BFPxO, используется метод измерения переходных процессов спада напряжения холостого хода (OCVD). Аномальное переходное явление с «чрезмерно длительным» временем релаксации, превышающим 10 с, вероятно, обусловлено процессом деполяризации BFPxO. Следовательно, мы выявляем скрытые фотоактивные свойства ферроидных перовскитных оксидов, которые могут быть обусловлены синергетической кинетикой поляризации/деполяризации, связанной с ферроэлектрическими доменами, и, в частности, могут быть вызваны легированием благородными металлами."""
 
 # вопрос:
@@ -133,16 +175,6 @@ REACT_SYSTEM_PROMPT = """
 2. Не придумывай данные — используй только ответы от инструментов
 3. Если информации не хватает, продолжай поиск
 """
-
-# ── Инициализация LLM ────────────────────────────────────────────────────────
-llm = ChatOpenAI(
-    base_url=LLM_URL,
-    api_key="lm-studio",
-    model=MODEL,
-    temperature=0.1,
-    max_tokens=10000
-)
-
 
 # ── Узлы графа ───────────────────────────────────────────────────────────────
 
@@ -420,7 +452,7 @@ def run_and_trace(agent: CompiledStateGraph, query: str):
                 if msg.content and msg.content.strip():
                     zip_content = "..."if len(msg.content) > 200 else ""
                     print(f'THOUGHT: {msg.content[:200]}{zip_content}')
-                    args_dumps = json.dumps(tc["args"], ensure_ascii=False)
+                args_dumps = json.dumps(tc["args"], ensure_ascii=False)
                 print(f'ACTION:  {tc["name"]}({args_dumps})')
 
         elif msg_type == 'ToolMessage':
