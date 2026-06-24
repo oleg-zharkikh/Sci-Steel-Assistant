@@ -1,13 +1,9 @@
 from pydantic import BaseModel, Field
 from langchain.tools import tool
 import json
-import secrets
-import string
-import requests
 import re
 import os
-from typing import Any, Dict, List, Optional, Tuple, TypedDict, Annotated
-from operator import add
+from typing import Any, Dict, List, Optional
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import (
@@ -18,6 +14,8 @@ from langgraph.graph.state import CompiledStateGraph
 import time
 
 from dotenv import load_dotenv
+from app.indexing import DEFAULT_COLLECTION, DEFAULT_INDEX_DIR
+from app.retrieval import HybridRetriever, format_chunks_for_llm
 
 load_dotenv()
 
@@ -25,47 +23,65 @@ load_dotenv()
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Конфигурация ─────────────────────────────────────────────────────────────
-LOCAL_MODEL = 'qwen/qwen3.5-9b'
-LOCAL_LLM_URL = 'http://127.0.0.1:1234/v1'
-LOCAL_API_KEY = "lm-studio"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "local").lower()
+"""local = LM Studio, external = OpenAI-compatible API, yandex = Yandex AI Studio."""
+
+LOCAL_MODEL = os.getenv("LOCAL_MODEL", "qwen/qwen3.5-9b")
+LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:1234/v1")
+LOCAL_API_KEY = os.getenv("LOCAL_API_KEY", "lm-studio")
+
+EXTERNAL_LLM_URL = os.getenv("EXTERNAL_LLM_URL", os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+EXTERNAL_LLM_MODEL = os.getenv("EXTERNAL_LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+EXTERNAL_LLM_API_KEY = os.getenv("EXTERNAL_LLM_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+
+YANDEX_CLOUD_FOLDER = os.getenv("YANDEX_CLOUD_FOLDER", "")
+YANDEX_CLOUD_API_KEY = os.getenv("YANDEX_CLOUD_API_KEY", "")
+YANDEX_CLOUD_MODEL = os.getenv("YANDEX_CLOUD_MODEL", "qwen3.6-35b-a3b/latest")
+YANDEX_LLM_URL = os.getenv("YANDEX_LLM_URL", "https://ai.api.cloud.yandex.net/v1")
+
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "10000"))
 
 # Общие параметры
-MAX_SEARCH_ITER = 5
+MAX_SEARCH_ITER = int(os.getenv("MAX_SEARCH_ITER", "5"))
 """Лимит итераций поиска для защиты от бесконечного зацикливания"""
 
-USE_LOCAL_LLM = False
-"""True = LM Studio (локально), False = Yandex AI Studio."""
-
-# Локальная LLM (LM Studio)
-
-# Облачная LLM (Yandex AI Studio)
-YANDEX_CLOUD_FOLDER = "b1g4l2qvbrkalmtemb56"
-"""folder ID."""
-
-YANDEX_CLOUD_API_KEY = os.getenv('YANDEX_CLOUD_API_KEY', '')
-"""API ключ"""
-
-YANDEX_CLOUD_MODEL = "qwen3.6-35b-a3b/latest"
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", DEFAULT_COLLECTION)
+INDEX_DIR = os.getenv("TANTIVY_INDEX_DIR", DEFAULT_INDEX_DIR)
+RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "8"))
 
 # ── Инициализация LLM ────────────────────────────────────────────────────────
-if USE_LOCAL_LLM:
+if LLM_PROVIDER == "local":
     print(f"[INFO] Используем локальную LLM: {LOCAL_MODEL}")
     llm = ChatOpenAI(
         base_url=LOCAL_LLM_URL,
         api_key=LOCAL_API_KEY,
         model=LOCAL_MODEL,
-        temperature=0.1,
-        max_tokens=10000
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_TOKENS,
     )
-else:
+elif LLM_PROVIDER == "external":
+    print(f"[INFO] Используем внешнюю OpenAI-compatible LLM: {EXTERNAL_LLM_MODEL}")
+    llm = ChatOpenAI(
+        base_url=EXTERNAL_LLM_URL,
+        api_key=EXTERNAL_LLM_API_KEY,
+        model=EXTERNAL_LLM_MODEL,
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_TOKENS,
+    )
+elif LLM_PROVIDER == "yandex":
     print(f"[INFO] Используем Yandex AI Studio: {YANDEX_CLOUD_MODEL}")
     llm = ChatOpenAI(
-        base_url="https://ai.api.cloud.yandex.net/v1",
+        base_url=YANDEX_LLM_URL,
         api_key=YANDEX_CLOUD_API_KEY,
         model=f"gpt://{YANDEX_CLOUD_FOLDER}/{YANDEX_CLOUD_MODEL}",
-        temperature=0.1,
-        max_tokens=10000,
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_TOKENS,
         reasoning_effort=None,
+    )
+else:
+    raise ValueError(
+        "LLM_PROVIDER must be one of: local, external, yandex"
     )
 
 
@@ -94,58 +110,62 @@ class EvaluationResult(BaseModel):
                      'что нужно найти. Иначе пустая строка.'))
 
 
-# ── Вспомогательные функции для API ──────────────────────────────────────────
-def _make_api_request(
-    method: str, endpoint: str, token: Optional[str] = None,
-    json_data: Optional[Dict] = None, params: Optional[Dict] = None
-) -> Tuple[bool, Any]:
-    """Выполняет API-запрос."""
-    url = f'{API_BASE_URL}{endpoint}'
-    headers = {'Content-Type': 'application/json'}
-    if token:
-        headers['Authorization'] = f'Bearer {token}'
-
-    try:
-        response = requests.request(
-            method=method,
-            url=url,
-            headers=headers,
-            json=json_data,
-            params=params,
-            timeout=30
-        )
-        if response.status_code in [200, 201, 204]:
-            return (True, response.json()
-                    if response.content
-                    else {'status': 'success'})
-        else:
-            error_msg = (response.json().get('message', response.text)
-                         if response.content
-                         else f'HTTP {response.status_code}')
-            return (False,
-                    {'error': error_msg, 'status_code': response.status_code})
-    except requests.exceptions.RequestException as e:
-        return False, {'error': f'Network error: {str(e)}'}
-
-
 # ── Инструменты ──────────────────────────────────────────────────────────────
-# ЗАГЛУШКА:
-stub_data = """Мы успешно получили тонкие пленки BiFe(1-x)PdxO3 (BFPxO) (т.е. сегнетоэлектрический феррит висмута с частичным замещением ионов палладия в позиции Fe), а также гетероструктуру BFPxO/NiO методом золь-гель. В данной работе мы пытаемся разобраться в двух аспектах проблемы. С одной стороны, мы выясняем важную роль легирования палладием в оптоэлектронных характеристиках BFPxO. Мы устанавливаем взаимосвязи между валентностью палладия, искажением решетки и оптоэлектронными характеристиками BFPxO. Мы подтверждаем, что легирование палладием может минимизировать постоянную времени отклика BiFe(1-x)PdxO3 ниже 10 мс; при этом обнаружительная способность гетероструктуры BFPO/NiO может достигать примерно 109 Джонс. С другой стороны, для получения представления о различных стадиях затухания, существующих в BFPxO, используется метод измерения переходных процессов спада напряжения холостого хода (OCVD). Аномальное переходное явление с «чрезмерно длительным» временем релаксации, превышающим 10 с, вероятно, обусловлено процессом деполяризации BFPxO. Следовательно, мы выявляем скрытые фотоактивные свойства ферроидных перовскитных оксидов, которые могут быть обусловлены синергетической кинетикой поляризации/деполяризации, связанной с ферроэлектрическими доменами, и, в частности, могут быть вызваны легированием благородными металлами."""
+_retriever: HybridRetriever | None = None
 
-# вопрос:
-# Приведи хотя бы один пример получения тонкой пленки BiFe(1-x)PdxO3 (BFPxO). Достаточно общего ответа.
+
+def get_retriever() -> HybridRetriever:
+    """Ленивая инициализация локального поисковика."""
+    global _retriever
+    if _retriever is None:
+        _retriever = HybridRetriever(
+            collection_name=COLLECTION_NAME,
+            index_dir=INDEX_DIR,
+        )
+    return _retriever
+
+
+def _as_list(value: List[str] | str | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [str(item) for item in value]
+
+
+def _retrieval_error_message(error: Exception) -> str:
+    return (
+        "Не удалось выполнить поиск в локальном индексе. "
+        f"Коллекция: {COLLECTION_NAME}, индекс: {INDEX_DIR}. "
+        "Если индекс еще не создан, запустите: "
+        "venv/bin/python -m app.indexing. "
+        f"Техническая ошибка: {error}"
+    )
 
 @tool(description='Поиск в локальной базе данных по семантической близости')
 def retrieve_by_semantic_similarity(search_query: str) -> str:
     """Получает семантически-релевантную информацию из локальной базы данных."""
-    print('Заглушка: вызов поиска по семантике.')
-    return stub_data
+    try:
+        chunks = get_retriever().retrieve_semantic(
+            search_query,
+            top_k=RETRIEVAL_TOP_K,
+        )
+        return format_chunks_for_llm(chunks)
+    except Exception as error:
+        return _retrieval_error_message(error)
 
 @tool(description='Поиск в локальной базе данных по ключевым словам')
 def retrieve_by_keywords(must_include: List[str], must_not_include: List[str]) -> str:
     """Получает информацию из локальной базы данных по ключевым словам."""
-    print('Заглушка: вызов поиска по ключевым словам.')
-    return stub_data
+    try:
+        chunks = get_retriever().retrieve_keywords(
+            _as_list(must_include),
+            _as_list(must_not_include),
+            top_k=RETRIEVAL_TOP_K,
+        )
+        return format_chunks_for_llm(chunks)
+    except Exception as error:
+        return _retrieval_error_message(error)
 
 
 ALL_TOOLS = [retrieve_by_semantic_similarity, retrieve_by_keywords]
@@ -174,6 +194,7 @@ REACT_SYSTEM_PROMPT = """
 1. Вызывай только ОДИН инструмент за шаг
 2. Не придумывай данные — используй только ответы от инструментов
 3. Если информации не хватает, продолжай поиск
+4. В финальном ответе указывай, на какие найденные источники и чанки ты опираешься
 """
 
 # ── Узлы графа ───────────────────────────────────────────────────────────────
@@ -264,7 +285,12 @@ def parse_evaluation_response(text: str) -> Optional[dict]:
 
 
 def evaluate_node(state: AgentState):
-    """Узел оценки достаточности информации."""
+    """Узел оценки достаточности информации.
+
+    Для локальных моделей MVP использует детерминированную проверку вместо
+    отдельного LLM-оценщика: Qwen в LM Studio нестабильно поддерживает
+    structured output и может зависать на fallback-вызове.
+    """
     context = state.get('context', {})
 
     if context.get('force_end'):
@@ -288,6 +314,22 @@ def evaluate_node(state: AgentState):
         }
 
     messages = state['messages']
+    tool_messages = [msg for msg in messages if isinstance(msg, ToolMessage)]
+    last_message = messages[-1] if messages else None
+
+    if isinstance(last_message, AIMessage) and not getattr(last_message, 'tool_calls', None):
+        if tool_messages:
+            return {'messages': [], 'context': {**context, 'sufficient': True}}
+        advice_msg = HumanMessage(
+            content=(
+                "=== ЭКСПЕРТНАЯ ОЦЕНКА ===\n"
+                "Перед ответом нужно выполнить поиск в локальной базе данных."
+            )
+        )
+        return {'messages': [advice_msg], 'context': {**context, 'sufficient': False}}
+
+    if tool_messages:
+        return {'messages': [], 'context': {**context, 'sufficient': True}}
 
     # Формируем контекст для оценки
     context_parts = []
@@ -425,13 +467,17 @@ def create_react_agent(tools_list=None, system_prompt=None):
 
 # ── Запуск с трассировкой ────────────────────────────────────────────────────
 
-def run_and_trace(agent: CompiledStateGraph, query: str):
+def run_and_trace(
+    agent: CompiledStateGraph,
+    query: str,
+    history: list[BaseMessage] | None = None,
+):
     print(f'Пользователь: {query}')
     print('═' * 70)
 
     start_time = time.time()
     initial_state = {
-        'messages': [HumanMessage(content=query)],
+        'messages': (history or []) + [HumanMessage(content=query)],
         'context': {},
         'search_count': 0
     }
@@ -480,19 +526,64 @@ def run_and_trace(agent: CompiledStateGraph, query: str):
     return final_answer, result
 
 
+def enrich_query_interactively(query: str) -> str:
+    """Уточняет желаемую полноту ответа в CLI."""
+    print('\nРежим ответа:')
+    print('1 - кратко')
+    print('2 - подробно с источниками (по умолчанию)')
+    print('3 - обзор с пробелами в данных')
+    answer_mode = input('Выберите режим или нажмите Enter: ').strip()
+    modes = {
+        '1': 'краткий ответ, только главное',
+        '2': 'подробный ответ с указанием источников и чанков',
+        '3': 'обзор: найденные факты, сравнение источников и пробелы в данных',
+        '': 'подробный ответ с указанием источников и чанков',
+    }
+    mode_text = modes.get(answer_mode, answer_mode)
+    return f'{query}\n\nТребуемая полнота ответа: {mode_text}'
+
+
+def trim_history(messages: list[BaseMessage], max_messages: int = 16) -> list[BaseMessage]:
+    """Ограничивает историю, чтобы не раздувать контекст."""
+    return messages[-max_messages:]
+
+
 # ── Точка входа ──────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     print('Инициализация агента...')
     react_agent = create_react_agent()
     print('Агент готов к работе!\n')
+    session_history: list[BaseMessage] = []
 
     while True:
         user_msg = input('> ')
         if user_msg.strip().lower() in ('exit', 'выход', 'ничего'):
             break
-        answer, state = run_and_trace(react_agent, user_msg)
+        query = enrich_query_interactively(user_msg)
+        answer, state = run_and_trace(react_agent, query, session_history)
+        session_history = trim_history(state['messages'])
         print(f'\nФинальный ответ: {answer}')
+
+        follow_up = input(
+            '\nПродолжить поиск в текущем контексте? '
+            'Напишите направление или нажмите Enter для нового вопроса: '
+        ).strip()
+        while follow_up:
+            follow_up_query = (
+                'Продолжи анализ предыдущего запроса. '
+                f'Новое направление поиска: {follow_up}'
+            )
+            answer, state = run_and_trace(
+                react_agent,
+                enrich_query_interactively(follow_up_query),
+                session_history,
+            )
+            session_history = trim_history(state['messages'])
+            print(f'\nФинальный ответ: {answer}')
+            follow_up = input(
+                '\nПродолжить еще? Напишите направление или нажмите Enter: '
+            ).strip()
 
 
 """Пример запуска агента на данных заглушки:

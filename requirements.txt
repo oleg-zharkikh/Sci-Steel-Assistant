@@ -10,3 +10,7 @@ langgraph
 pandas
 tantivy
 kuzu
+streamlit
+chromadb
+sentence-transformers
+scikit-learn
