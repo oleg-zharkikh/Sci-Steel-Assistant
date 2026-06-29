@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local search indexes
+tantivy_index/
+chroma_db/
+models/

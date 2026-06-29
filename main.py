@@ -1,13 +1,10 @@
 from pydantic import BaseModel, Field
 from langchain.tools import tool
 import json
-import secrets
-import string
-import requests
 import re
 import os
-from typing import Any, Dict, List, Optional, Tuple, TypedDict, Annotated
-from operator import add
+import time
+from typing import Any, Dict, List, Optional
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import (
@@ -15,9 +12,12 @@ from langchain_core.messages import (
 )
 from langgraph.graph import StateGraph, END, START, MessagesState
 from langgraph.graph.state import CompiledStateGraph
-import time
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.memory import MemorySaver
 
 from dotenv import load_dotenv
+from app.indexing import DEFAULT_COLLECTION, DEFAULT_INDEX_DIR
+from app.retrieval import HybridRetriever, format_chunks_for_llm
 
 load_dotenv()
 
@@ -25,47 +25,65 @@ load_dotenv()
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Конфигурация ─────────────────────────────────────────────────────────────
-LOCAL_MODEL = 'qwen/qwen3.5-9b'
-LOCAL_LLM_URL = 'http://127.0.0.1:1234/v1'
-LOCAL_API_KEY = "lm-studio"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "local").lower()
+"""local = LM Studio, external = OpenAI-compatible API, yandex = Yandex AI Studio."""
+
+LOCAL_MODEL = os.getenv("LOCAL_MODEL", "qwen/qwen3.5-9b")
+LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:1234/v1")
+LOCAL_API_KEY = os.getenv("LOCAL_API_KEY", "lm-studio")
+
+EXTERNAL_LLM_URL = os.getenv("EXTERNAL_LLM_URL", os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+EXTERNAL_LLM_MODEL = os.getenv("EXTERNAL_LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+EXTERNAL_LLM_API_KEY = os.getenv("EXTERNAL_LLM_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+
+YANDEX_CLOUD_FOLDER = os.getenv("YANDEX_CLOUD_FOLDER", "")
+YANDEX_CLOUD_API_KEY = os.getenv("YANDEX_CLOUD_API_KEY", "")
+YANDEX_CLOUD_MODEL = os.getenv("YANDEX_CLOUD_MODEL", "qwen3.6-35b-a3b/latest")
+YANDEX_LLM_URL = os.getenv("YANDEX_LLM_URL", "https://ai.api.cloud.yandex.net/v1")
+
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", 0.1))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", 10000))
 
 # Общие параметры
-MAX_SEARCH_ITER = 5
+MAX_SEARCH_ITER = int(os.getenv("MAX_SEARCH_ITER", 10))
 """Лимит итераций поиска для защиты от бесконечного зацикливания"""
 
-USE_LOCAL_LLM = False
-"""True = LM Studio (локально), False = Yandex AI Studio."""
-
-# Локальная LLM (LM Studio)
-
-# Облачная LLM (Yandex AI Studio)
-YANDEX_CLOUD_FOLDER = "b1g4l2qvbrkalmtemb56"
-"""folder ID."""
-
-YANDEX_CLOUD_API_KEY = os.getenv('YANDEX_CLOUD_API_KEY', '')
-"""API ключ"""
-
-YANDEX_CLOUD_MODEL = "qwen3.6-35b-a3b/latest"
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", DEFAULT_COLLECTION)
+INDEX_DIR = os.getenv("TANTIVY_INDEX_DIR", DEFAULT_INDEX_DIR)
+RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "8"))
 
 # ── Инициализация LLM ────────────────────────────────────────────────────────
-if USE_LOCAL_LLM:
+if LLM_PROVIDER == "local":
     print(f"[INFO] Используем локальную LLM: {LOCAL_MODEL}")
     llm = ChatOpenAI(
         base_url=LOCAL_LLM_URL,
         api_key=LOCAL_API_KEY,
         model=LOCAL_MODEL,
-        temperature=0.1,
-        max_tokens=10000
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_TOKENS,
     )
-else:
+elif LLM_PROVIDER == "external":
+    print(f"[INFO] Используем внешнюю OpenAI-compatible LLM: {EXTERNAL_LLM_MODEL}")
+    llm = ChatOpenAI(
+        base_url=EXTERNAL_LLM_URL,
+        api_key=EXTERNAL_LLM_API_KEY,
+        model=EXTERNAL_LLM_MODEL,
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_TOKENS,
+    )
+elif LLM_PROVIDER == "yandex":
     print(f"[INFO] Используем Yandex AI Studio: {YANDEX_CLOUD_MODEL}")
     llm = ChatOpenAI(
-        base_url="https://ai.api.cloud.yandex.net/v1",
+        base_url=YANDEX_LLM_URL,
         api_key=YANDEX_CLOUD_API_KEY,
         model=f"gpt://{YANDEX_CLOUD_FOLDER}/{YANDEX_CLOUD_MODEL}",
-        temperature=0.1,
-        max_tokens=10000,
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_TOKENS,
         reasoning_effort=None,
+    )
+else:
+    raise ValueError(
+        "LLM_PROVIDER must be one of: local, external, yandex"
     )
 
 
@@ -74,6 +92,12 @@ class AgentState(MessagesState):
     """Расширенное состояние с памятью и счетчиком поисков по БД."""
     context: Dict[str, Any] = Field(default_factory=dict)
     search_count: int = 0
+
+    summary: Optional[str] = None
+    """Сжатое изложение найденных материалов."""
+
+    should_finish: bool = False
+    """Флаг остановки пользователем."""
 
 
 # ── Схемы аргументов для инструментов ────────────────────────────────────────
@@ -94,58 +118,62 @@ class EvaluationResult(BaseModel):
                      'что нужно найти. Иначе пустая строка.'))
 
 
-# ── Вспомогательные функции для API ──────────────────────────────────────────
-def _make_api_request(
-    method: str, endpoint: str, token: Optional[str] = None,
-    json_data: Optional[Dict] = None, params: Optional[Dict] = None
-) -> Tuple[bool, Any]:
-    """Выполняет API-запрос."""
-    url = f'{API_BASE_URL}{endpoint}'
-    headers = {'Content-Type': 'application/json'}
-    if token:
-        headers['Authorization'] = f'Bearer {token}'
-
-    try:
-        response = requests.request(
-            method=method,
-            url=url,
-            headers=headers,
-            json=json_data,
-            params=params,
-            timeout=30
-        )
-        if response.status_code in [200, 201, 204]:
-            return (True, response.json()
-                    if response.content
-                    else {'status': 'success'})
-        else:
-            error_msg = (response.json().get('message', response.text)
-                         if response.content
-                         else f'HTTP {response.status_code}')
-            return (False,
-                    {'error': error_msg, 'status_code': response.status_code})
-    except requests.exceptions.RequestException as e:
-        return False, {'error': f'Network error: {str(e)}'}
-
-
 # ── Инструменты ──────────────────────────────────────────────────────────────
-# ЗАГЛУШКА:
-stub_data = """Мы успешно получили тонкие пленки BiFe(1-x)PdxO3 (BFPxO) (т.е. сегнетоэлектрический феррит висмута с частичным замещением ионов палладия в позиции Fe), а также гетероструктуру BFPxO/NiO методом золь-гель. В данной работе мы пытаемся разобраться в двух аспектах проблемы. С одной стороны, мы выясняем важную роль легирования палладием в оптоэлектронных характеристиках BFPxO. Мы устанавливаем взаимосвязи между валентностью палладия, искажением решетки и оптоэлектронными характеристиками BFPxO. Мы подтверждаем, что легирование палладием может минимизировать постоянную времени отклика BiFe(1-x)PdxO3 ниже 10 мс; при этом обнаружительная способность гетероструктуры BFPO/NiO может достигать примерно 109 Джонс. С другой стороны, для получения представления о различных стадиях затухания, существующих в BFPxO, используется метод измерения переходных процессов спада напряжения холостого хода (OCVD). Аномальное переходное явление с «чрезмерно длительным» временем релаксации, превышающим 10 с, вероятно, обусловлено процессом деполяризации BFPxO. Следовательно, мы выявляем скрытые фотоактивные свойства ферроидных перовскитных оксидов, которые могут быть обусловлены синергетической кинетикой поляризации/деполяризации, связанной с ферроэлектрическими доменами, и, в частности, могут быть вызваны легированием благородными металлами."""
+_retriever: HybridRetriever | None = None
 
-# вопрос:
-# Приведи хотя бы один пример получения тонкой пленки BiFe(1-x)PdxO3 (BFPxO). Достаточно общего ответа.
+
+def get_retriever() -> HybridRetriever:
+    """Ленивая инициализация локального поисковика."""
+    global _retriever
+    if _retriever is None:
+        _retriever = HybridRetriever(
+            collection_name=COLLECTION_NAME,
+            index_dir=INDEX_DIR,
+        )
+    return _retriever
+
+
+def _as_list(value: List[str] | str | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [str(item) for item in value]
+
+
+def _retrieval_error_message(error: Exception) -> str:
+    return (
+        "Не удалось выполнить поиск в локальном индексе. "
+        f"Коллекция: {COLLECTION_NAME}, индекс: {INDEX_DIR}. "
+        "Если индекс еще не создан, запустите: "
+        "venv/bin/python -m app.indexing. "
+        f"Техническая ошибка: {error}"
+    )
 
 @tool(description='Поиск в локальной базе данных по семантической близости')
 def retrieve_by_semantic_similarity(search_query: str) -> str:
     """Получает семантически-релевантную информацию из локальной базы данных."""
-    print('Заглушка: вызов поиска по семантике.')
-    return stub_data
+    try:
+        chunks = get_retriever().retrieve_semantic(
+            search_query,
+            top_k=RETRIEVAL_TOP_K,
+        )
+        return format_chunks_for_llm(chunks)
+    except Exception as error:
+        return _retrieval_error_message(error)
 
 @tool(description='Поиск в локальной базе данных по ключевым словам')
 def retrieve_by_keywords(must_include: List[str], must_not_include: List[str]) -> str:
     """Получает информацию из локальной базы данных по ключевым словам."""
-    print('Заглушка: вызов поиска по ключевым словам.')
-    return stub_data
+    try:
+        chunks = get_retriever().retrieve_keywords(
+            _as_list(must_include),
+            _as_list(must_not_include),
+            top_k=RETRIEVAL_TOP_K,
+        )
+        return format_chunks_for_llm(chunks)
+    except Exception as error:
+        return _retrieval_error_message(error)
 
 
 ALL_TOOLS = [retrieve_by_semantic_similarity, retrieve_by_keywords]
@@ -161,19 +189,22 @@ REACT_SYSTEM_PROMPT = """
 3. OBSERVATION: Проанализируй результат, реши: нужен ли следующий шаг или можно ответить
 
 Доступные инструменты:
-- retrieve_by_semantic_similarity(search_query: str) → семантический поиск
-- retrieve_by_keywords(must_include: List[str], must_not_include: List[str]) → поиск по ключевым словам
+- retrieve_by_semantic_similarity(search_query: str) → семантический поиск по поисковой фразе на английском языке
+- retrieve_by_keywords(must_include: List[str], must_not_include: List[str]) → поиск по ключевым словам (английский язык)
 
 ВАЖНО: Ты ДОЛЖЕН вызывать инструменты для получения информации из базы данных. Не отвечай на вопросы напрямую — используй только данные из инструментов.
 
 Пример вызова инструмента:
-- retrieve_by_semantic_similarity("сплав INCONEL")
+- retrieve_by_semantic_similarity("INCONEL alloy")
 - retrieve_by_keywords(["INCONEL", "alloy"], [])
 
 Важные правила:
-1. Вызывай только ОДИН инструмент за шаг
-2. Не придумывай данные — используй только ответы от инструментов
-3. Если информации не хватает, продолжай поиск
+1. В базе данных вся информация на английском языке. Генерируй все поисковые запросы на английском
+2. Все размышления и выводы - на русском языке
+3. Вызывай только ОДИН инструмент за шаг
+4. Не придумывай данные — используй только ответы от инструментов
+5. Если информации не хватает, продолжай поиск
+6. В финальном ответе указывай, на какие найденные источники и чанки ты опираешься
 """
 
 # ── Узлы графа ───────────────────────────────────────────────────────────────
@@ -235,6 +266,7 @@ def tools_node(state: AgentState):
                 'retrieve_by_semantic_similarity', 'retrieve_by_keywords'
             ]:
                 search_increment += 1
+                state['search_count'] += 1
         except Exception as e:
             results.append(ToolMessage(
                 content=f'Ошибка выполнения {tool_name}: {str(e)}',
@@ -266,30 +298,98 @@ def parse_evaluation_response(text: str) -> Optional[dict]:
 def evaluate_node(state: AgentState):
     """Узел оценки достаточности информации."""
     context = state.get('context', {})
-
-    if context.get('force_end'):
-        return {'messages': [], 'context': {**context, 'sufficient': True}}
-
+    messages = state['messages']
     search_count = state.get('search_count', 0)
 
-    # Защита от зацикливания
+    # Вспомогательная функция для генерации резюме
+    def generate_summary(text: str) -> str:
+        if not text.strip():
+            return "Нет данных для составления резюме."
+        try:
+            summary_prompt = (
+                "На основе собранной информации составь краткое резюме "
+                "(3-4 предложения) того, что уже известно по запросу пользователя."
+            )
+            summary_response = llm.invoke(
+                [
+                    SystemMessage(content="Ты — помощник, составляющий краткие резюме."),
+                    HumanMessage(content=text + "\n\n" + summary_prompt)
+                ]
+            )
+            result = summary_response.content.strip()
+            return result if result else "Резюме не сгенерировано (пустой ответ)."
+        except Exception as e:
+            print(f"[Ошибка генерации резюме]: {e}")
+            return f"Ошибка генерации резюме: {str(e)}"
+
+    # ---- Ранние возвраты (force_end, лимит) ----
+    if context.get('force_end'):
+        print("[DEBUG] force_end возврат")
+        return {
+            'messages': [],
+            'context': {**context, 'sufficient': True},
+            'summary': "Принудительное завершение (force_end)"
+        }
+
     if search_count >= MAX_SEARCH_ITER:
-        print((f'\n[Оценка]: Достигнут лимит поисков ({MAX_SEARCH_ITER}). '
-               'Принудительное формирование ответа.'))
+        print(f'\n[Оценка]: Достигнут лимит поисков ({MAX_SEARCH_ITER}). Принудительное формирование ответа.')
+        # Собираем контекст для резюме
+        context_parts = []
+        for msg in messages:
+            if isinstance(msg, HumanMessage):
+                context_parts.append(f"[Запрос пользователя]: {msg.content}")
+            elif isinstance(msg, AIMessage):
+                if msg.content:
+                    context_parts.append(f"[Размышления агента]: {msg.content}")
+                if getattr(msg, 'tool_calls', None):
+                    for tc in msg.tool_calls:
+                        context_parts.append(f"[Агент вызвал]: {tc['name']}({tc['args']})")
+            elif isinstance(msg, ToolMessage):
+                content_preview = (msg.content[:1500] + "..." if len(msg.content) > 1500 else msg.content)
+                context_parts.append(f"[Результат из БД ({msg.name})]: {content_preview}")
+        context_text = "\n".join(context_parts)
+        print(f"[DEBUG] context_text length: {len(context_text)}")
+        summary = generate_summary(context_text)
+        print(f"[DEBUG] summary length: {len(summary)}")
+        advice_text = "Достигнут лимит поисков. Попробуйте переформулировать запрос или использовать другие ключевые слова."
         limit_msg = HumanMessage(
-            content="=== ЛИМИТ ИТЕРАЦИЙ === "
-                    "Достигнут максимальный лимит поисков по базе данных. "
+            content="=== ЛИМИТ ИТЕРАЦИЙ === Достигнут максимальный лимит поисков по базе данных. "
                     "Немедленно сформируй окончательный ответ на основе той информации, что уже есть. "
                     "Если данных не хватает, честно сообщи пользователю, что не удалось найти полную информацию."
         )
         return {
             'messages': [limit_msg],
-            'context': {**context, 'force_end': True, 'sufficient': False}
+            'context': {**context, 'force_end': True, 'sufficient': False, 'advice': advice_text},
+            'summary': summary
         }
 
-    messages = state['messages']
+    # ---- Основная логика оценки ----
+    tool_messages = [msg for msg in messages if isinstance(msg, ToolMessage)]
+    last_message = messages[-1] if messages else None
 
-    # Формируем контекст для оценки
+    # Если агент уже дал ответ без инструментов и есть результаты поиска – считаем достаточным
+    if isinstance(last_message, AIMessage) and not getattr(last_message, 'tool_calls', None):
+        if tool_messages:
+            print("[DEBUG] Агент дал ответ, есть результаты поиска – достаточно.")
+            return {
+                'messages': [],
+                'context': {**context, 'sufficient': True},
+                'summary': "Агент уже дал ответ на основе данных."
+            }
+        # Если агент ответил, но поиска не было – просим поискать
+        advice_msg = HumanMessage(
+            content="=== ЭКСПЕРТНАЯ ОЦЕНКА ===\nПеред ответом нужно выполнить поиск в локальной базе данных."
+        )
+        return {
+            'messages': [advice_msg],
+            'context': {**context, 'sufficient': False},
+            'summary': "Нет результатов поиска."
+        }
+
+    # Если есть результаты поиска, но агент ещё не ответил – всё равно проведём оценку
+    # (этот блок можно пропустить, но оставим для ясности)
+
+    # Формируем полный контекст для оценки и резюме
     context_parts = []
     for msg in messages:
         if isinstance(msg, HumanMessage):
@@ -301,18 +401,13 @@ def evaluate_node(state: AgentState):
                 for tc in msg.tool_calls:
                     context_parts.append(f"[Агент вызвал]: {tc['name']}({tc['args']})")
         elif isinstance(msg, ToolMessage):
-            content_preview = (msg.content[:1500] + "..."
-                               if len(msg.content) > 1500
-                               else msg.content)
+            content_preview = (msg.content[:1500] + "..." if len(msg.content) > 1500 else msg.content)
             context_parts.append(f"[Результат из БД ({msg.name})]: {content_preview}")
-
     context_text = "\n".join(context_parts)
 
-#     eval_system_prompt = """Ты — критически мыслящий эксперт в области металлургии. 
-# Оцени, достаточно ли собранной информации в контексте для исчерпывающего и научно обоснованного ответа на запрос пользователя.
-# Если информации недостаточно, укажи, каких именно данных не хватает и что нужно поискать дополнительно."""
+    # Оценка достаточности (structured output)
     eval_system_prompt = """Ты — критически мыслящий эксперт в области металлургии. 
-Оцени, достаточно ли собранной информации в контексте для обоснованного ответа на запрос пользователя. Учитывай пожелания пользователя относительно полноты ответа. Если не полнота не задана - достатоно любой найденной информации.
+Оцени, достаточно ли собранной информации в контексте для обоснованного ответа на запрос пользователя. Учитывай пожелания пользователя относительно полноты ответа. Если полнота не задана - достаточно любой найденной информации.
 Если информации недостаточно, укажи, каких именно данных не хватает и что нужно поискать дополнительно."""
 
     eval_user_prompt = f"""КОНТЕКСТ ДИАЛОГА:
@@ -326,52 +421,99 @@ def evaluate_node(state: AgentState):
     try:
         structured_llm = llm.with_structured_output(EvaluationResult)
         result = structured_llm.invoke(
-            [
-                SystemMessage(content=eval_system_prompt),
-                HumanMessage(content=eval_user_prompt)
-            ]
+            [SystemMessage(content=eval_system_prompt), HumanMessage(content=eval_user_prompt)]
         )
         is_sufficient = result.is_sufficient
         advice = result.advice
     except Exception as e:
-        print((f'[Оценка]: Structured output failed ({e}), '
-               'using fallback text parsing...'))
+        print(f'[Оценка]: Structured output failed ({e}), using fallback...')
         fallback_prompt = """Оцени достаточность информации и ответь СТРОГО в формате JSON без лишнего текста:
 {
   "is_sufficient": true/false,
   "advice": "совет или пусто"
 }"""
         response = llm.invoke(
-            [
-                SystemMessage(content=eval_system_prompt),
-                HumanMessage(content=eval_user_prompt + "\n\n" + fallback_prompt)
-            ]
+            [SystemMessage(content=eval_system_prompt), HumanMessage(content=eval_user_prompt + "\n\n" + fallback_prompt)]
         )
         parsed = parse_evaluation_response(response.content)
-
         if parsed and 'is_sufficient' in parsed:
-            val = parsed['is_sufficient']
-            if isinstance(val, bool):
-                is_sufficient = val
-            elif isinstance(val, str):
-                is_sufficient = val.lower() in ('true', '1', 'yes', 'да', 'истина')
-            else:
-                is_sufficient = bool(val)
+            is_sufficient = parsed['is_sufficient'] in (True, 'true', 'True', 'да', '1')
             advice = str(parsed.get('advice', ''))
         else:
             print('[Оценка]: Failed to parse. Defaulting to sufficient.')
             is_sufficient = True
 
+    # Генерируем резюме на основе контекста
+    print(f"[DEBUG] context length: {len(context_text)}")
+    summary = generate_summary(context_text)
+    print(f"[DEBUG] Сгенерированное резюме: {summary[:100]}...")  # отладка
+
     if is_sufficient:
         print('\n[Оценка эксперта]: Информации достаточно для ответа.')
-        return {'messages': [], 'context': {**context, 'sufficient': True}}
+        return {
+            'messages': [],
+            'context': {**context, 'sufficient': True, 'advice': advice},
+            'summary': summary
+        }
     else:
         print(f'\n[Оценка эксперта]: Информации недостаточно. Совет: {advice}')
         advice_msg = HumanMessage(
             content=f"=== ЭКСПЕРТНАЯ ОЦЕНКА ===\nСобранной информации НЕДОСТАТОЧНО.\n"
                     f"Совет по дальнейшему поиску: {advice}\nПожалуйста, вызови инструменты для поиска недостающих данных."
         )
-        return {'messages': [advice_msg], 'context': {**context, 'sufficient': False}}
+        return {
+            'messages': [advice_msg],
+            'context': {**context, 'sufficient': False, 'advice': advice},
+            'summary': summary
+        }
+
+
+def human_feedback_node(state: AgentState):
+    """Узел выводит пользователю резюме и совет эксперта.
+
+    Цикл прерывается для ввода. Полученный ввод анализируется."""
+    context = state.get('context', {})
+    sufficient = context.get('sufficient', False)
+    advice = context.get('advice', '')
+    summary = state.get('summary') or 'Нет резюме'  # если пустая строка – заменим
+
+    print(f"[DEBUG] Резюме в human_feedback: {summary[:100]}...")  # отладка
+
+    user_message = f"""
+    **Резюме найденной информации:**
+    {summary}
+
+    **Совет эксперта:** {advice if advice else 'Информации достаточно, можно готовить ответ.'}
+
+    Что делаем?
+    - Нажмите Enter (пустой ввод) – согласиться с экспертом.
+    - Напишите "достаточно" или "ответ" – сразу перейти к финальному ответу.
+    - Или дайте новые указания для поиска (например, "поищи ещё про легирование палладием").
+    """
+
+    user_input = interrupt(user_message)
+
+    user_input_clean = user_input.strip().lower()
+    if user_input_clean == '':
+        if sufficient:
+            return Command(goto=END, update={'should_finish': True})
+        else:
+            advice_msg = HumanMessage(
+                content=f"=== ЭКСПЕРТНАЯ ОЦЕНКА ===\nСобранной информации НЕДОСТАТОЧНО.\nСовет: {advice}\nПожалуйста, выполни поиск согласно совету."
+            )
+            return Command(
+                goto='agent',
+                update={'messages': [advice_msg], 'should_finish': False}
+            )
+    elif any(word in user_input_clean for word in ['достаточно', 'хватит', 'ответ', 'закончить', 'stop']):
+        return Command(goto=END, update={'should_finish': True})
+    else:
+        # Новые инструкции
+        user_new_msg = HumanMessage(content=user_input)
+        return Command(
+            goto='agent',
+            update={'messages': [user_new_msg], 'should_finish': False}
+        )
 
 
 def should_continue(state: AgentState):
@@ -381,15 +523,6 @@ def should_continue(state: AgentState):
         return 'tools'
     # Если агент сгенерировал текст, отправляем на оценку эксперту
     return 'evaluate'
-
-
-def route_after_evaluation(state: AgentState):
-    """Определяет следующий шаг после оценки эксперта."""
-    context = state.get('context', {})
-    if context.get('sufficient') is True:
-        return 'end'
-    # Если не хватает или сработал лимит (но агент еще не сформировал ответ)
-    return 'agent'
 
 
 # ── Сборка графа ─────────────────────────────────────────────────────────────
@@ -405,79 +538,137 @@ def create_react_agent(tools_list=None, system_prompt=None):
     workflow.add_node('agent', agent_node)
     workflow.add_node('tools', tools_node)
     workflow.add_node('evaluate', evaluate_node)
+    workflow.add_node('human_feedback', human_feedback_node)
 
     workflow.add_edge(START, 'agent')
 
     workflow.add_conditional_edges(
-        'agent', should_continue,
+        'agent',
+        should_continue,
         {'tools': 'tools', 'evaluate': 'evaluate'}
     )
 
     workflow.add_edge('tools', 'agent')
+    workflow.add_edge('evaluate', 'human_feedback')
 
-    workflow.add_conditional_edges(
-        'evaluate', route_after_evaluation,
-        {'agent': 'agent', 'end': END}
-    )
-
-    return workflow.compile()
+    return workflow.compile(checkpointer=MemorySaver())
 
 
 # ── Запуск с трассировкой ────────────────────────────────────────────────────
+def run_and_trace(
+        agent: CompiledStateGraph,
+        query: str,
+        session_history: Optional[List[BaseMessage]] = None):
+    """Запускает агента с интерактивным циклом.
 
-def run_and_trace(agent: CompiledStateGraph, query: str):
+    - Выводит трассировку шагов TAO.
+    - При необходимости запрашивает у пользователя решение (через interrupt).
+    - Возвращает финальный ответ и итоговое состояние.
+    """
     print(f'Пользователь: {query}')
     print('═' * 70)
 
     start_time = time.time()
+
+    if session_history:
+        messages = session_history + [HumanMessage(content=query)]
+    else:
+        messages = [HumanMessage(content=query)]
+
     initial_state = {
-        'messages': [HumanMessage(content=query)],
+        'messages': messages,
         'context': {},
-        'search_count': 0
+        'search_count': 0,
+        'summary': None,
+        'should_finish': False
     }
-    result = agent.invoke(initial_state)
-    elapsed = time.time() - start_time
+
+    config = {"configurable": {"thread_id": "interactive_thread"}}
 
     tao_steps = 0
     tool_calls_count = 0
 
-    for i, msg in enumerate(result['messages']):
-        msg_type = type(msg).__name__
+    for event in agent.stream(initial_state, config, stream_mode="updates"):
+        if "__interrupt__" in event:
+            interrupt_data = event["__interrupt__"][0].value
+            print(interrupt_data)
+            user_response = input("Ваш ответ: ")
+            agent.update_state(config, Command(resume=user_response))
+            continue
 
-        if msg_type == 'AIMessage' and getattr(msg, 'tool_calls', None):
-            tao_steps += 1
-            for tc in msg.tool_calls:
-                tool_calls_count += 1
-                print(f'\n  Шаг TAO #{tao_steps}')
-                if msg.content and msg.content.strip():
-                    zip_content = "..."if len(msg.content) > 200 else ""
-                    print(f'THOUGHT: {msg.content[:200]}{zip_content}')
-                args_dumps = json.dumps(tc["args"], ensure_ascii=False)
-                print(f'ACTION:  {tc["name"]}({args_dumps})')
+        # --- Обработка обновлений от узлов ---
+        for node_name, node_output in event.items():
+            if node_name == "agent":
+                messages = node_output.get('messages', [])
+                for msg in messages:
+                    if isinstance(msg, AIMessage) and getattr(msg, 'tool_calls', None):
+                        tao_steps += 1
+                        for tc in msg.tool_calls:
+                            tool_calls_count += 1
+                            print(f'\n  Шаг TAO #{tao_steps}')
+                            if msg.content and msg.content.strip():
+                                preview = msg.content[:200] + ("..." if len(msg.content) > 200 else "")
+                                print(f'THOUGHT: {preview}')
+                            args_str = json.dumps(tc["args"], ensure_ascii=False)
+                            print(f'ACTION:  {tc["name"]}({args_str})')
+                    elif isinstance(msg, AIMessage) and msg.content and not getattr(msg, 'tool_calls', None):
+                        pass
 
-        elif msg_type == 'ToolMessage':
-            zip_content = "..." if len(msg.content) > 180 else msg.content
-            preview = msg.content[:180] + zip_content
-            print(f'OBSERVE: {preview}')
+            elif node_name == "tools":
+                messages = node_output.get('messages', [])
+                for msg in messages:
+                    if isinstance(msg, ToolMessage):
+                        preview = msg.content[:180] + ("..." if len(msg.content) > 180 else "")
+                        print(f'OBSERVE: {preview}')
 
-        elif (msg_type == 'HumanMessage'
-              and ('ЭКСПЕРТНАЯ ОЦЕНКА' in msg.content
-                   or 'ЛИМИТ ИТЕРАЦИЙ' in msg.content)):
-            print(f'\n--- {msg.content} ---')
+            elif node_name == "evaluate":
+                context = node_output.get('context', {})
+                sufficient = context.get('sufficient', False)
+                advice = context.get('advice', '')
+                print(f'\n[Оценка эксперта]: {"Достаточно" if sufficient else "Недостаточно"}')
+                if advice:
+                    print(f'Совет: {advice}')
 
-        elif msg_type == 'AIMessage' and not getattr(msg, 'tool_calls', None):
-            if msg.content and i > 0:
-                zip_content = "..." if len(msg.content) > 400 else ""
-                print(f'\nАгент: {msg.content[:400]}{zip_content}')
+            elif node_name == "human_feedback":
+                pass
+
+    final_state = agent.get_state(config).values
+    elapsed = time.time() - start_time
+
+    final_answer = None
+    for msg in reversed(final_state['messages']):
+        if isinstance(msg, AIMessage) and not getattr(msg, 'tool_calls', None) and msg.content:
+            final_answer = msg.content
+            break
+    if final_answer is None:
+        final_answer = "Нет ответа"
 
     print(f'\n{"═" * 70}')
     print(f'Статистика: шагов TAO={tao_steps}, вызовов инструментов={tool_calls_count}, время={elapsed:.2f}с')
 
-    final_answer = next(
-        (msg.content for msg in reversed(result['messages']) if isinstance(msg, AIMessage) and not getattr(msg, 'tool_calls', None)),
-        'Нет ответа'
-    )
-    return final_answer, result
+    return final_answer, final_state
+
+
+def enrich_query_interactively(query: str) -> str:
+    """Уточняет желаемую полноту ответа в CLI."""
+    print('\nРежим ответа:')
+    print('1 - кратко')
+    print('2 - подробно с источниками (по умолчанию)')
+    print('3 - обзор с пробелами в данных')
+    answer_mode = input('Выберите режим или нажмите Enter: ').strip()
+    modes = {
+        '1': 'краткий ответ, только главное',
+        '2': 'подробный ответ с указанием источников и чанков',
+        '3': 'обзор: найденные факты, сравнение источников и пробелы в данных',
+        '': 'подробный ответ с указанием источников и чанков',
+    }
+    mode_text = modes.get(answer_mode, answer_mode)
+    return f'{query}\n\nТребуемая полнота ответа: {mode_text}'
+
+
+def trim_history(messages: list[BaseMessage], max_messages: int = 16) -> list[BaseMessage]:
+    """Ограничивает историю, чтобы не раздувать контекст."""
+    return messages[-max_messages:]
 
 
 # ── Точка входа ──────────────────────────────────────────────────────────────
@@ -486,25 +677,33 @@ if __name__ == '__main__':
     print('Инициализация агента...')
     react_agent = create_react_agent()
     print('Агент готов к работе!\n')
+    session_history: list[BaseMessage] = []
 
     while True:
         user_msg = input('> ')
         if user_msg.strip().lower() in ('exit', 'выход', 'ничего'):
             break
-        answer, state = run_and_trace(react_agent, user_msg)
+        query = enrich_query_interactively(user_msg)
+        answer, state = run_and_trace(react_agent, query, session_history)
+        session_history = trim_history(state['messages'])
         print(f'\nФинальный ответ: {answer}')
 
-
-"""Пример запуска агента на данных заглушки:
-
-
-Статистика: шагов TAO=1, вызовов инструментов=1, время=40.27с
-
-Финальный ответ: На основе данных из базы данных, вот пример получения тонкой пленки BiFe(1-x)PdxO3 (BFPxO):
-
-**Метод синтеза:** Золь-гель метод
-
-В работе описывается получение тонких пленок BiFe(1-x)PdxO3 с последующим формированием гетероструктуры BFPxO/NiO методом золь-гель. Этот метод позволяет синтезировать сегнетоэлектрический феррит висмута с частичным замещением ионов палладия в позиции Fe, что приводит к изменению оптоэлектронных характеристик материала.
-
-Легирование палладием в данной системе позволяет минимизировать постоянную времени отклика до значений ниже 10 мс, а также выявить скрытые фотоактивные свойства ферроидных перовскитных оксидов, обусловленные синергетической кинетикой поляризации/деполяризации.
-"""
+        follow_up = input(
+            '\nПродолжить поиск в текущем контексте? '
+            'Напишите направление или нажмите Enter для нового вопроса: '
+        ).strip()
+        while follow_up:
+            follow_up_query = (
+                'Продолжи анализ предыдущего запроса. '
+                f'Новое направление поиска: {follow_up}'
+            )
+            answer, state = run_and_trace(
+                react_agent,
+                enrich_query_interactively(follow_up_query),
+                session_history,
+            )
+            session_history = trim_history(state['messages'])
+            print(f'\nФинальный ответ: {answer}')
+            follow_up = input(
+                '\nПродолжить еще? Напишите направление или нажмите Enter: '
+            ).strip()
