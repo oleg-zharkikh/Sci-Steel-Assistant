@@ -30,7 +30,7 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "local").lower()
 
 LOCAL_MODEL = os.getenv("LOCAL_MODEL", "qwen/qwen3.5-9b")
 LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:1234/v1")
-LOCAL_API_KEY = os.getenv("LOCAL_API_KEY", "lm-studio")
+LOCAL_API_KEY = os.getenv("LOCAL_API_KEY", "")
 
 EXTERNAL_LLM_URL = os.getenv("EXTERNAL_LLM_URL", os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
 EXTERNAL_LLM_MODEL = os.getenv("EXTERNAL_LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
